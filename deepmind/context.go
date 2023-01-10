@@ -7,7 +7,6 @@ import (
 	"github.com/algorand/go-algorand/protocol"
 	"go.uber.org/atomic"
 	"os"
-	"time"
 )
 
 // NoOpContext can be used when no recording should happen for a given code path
@@ -67,10 +66,6 @@ func (ctx *Context) DeepMindLog() []byte {
 // Block methods
 
 func (ctx *Context) LogBlock(block *bookkeeping.Block) {
-	if block.BlockHeader.Round == 1 {
-		// Sleep 5 seconds if we're on the first block so that firehose has time to start.
-		time.Sleep(time.Second * 5)
-	}
 	protocol.JSONHandle.Indent = 0
 	ctx.printer.Print(fmt.Sprintf("BLOCK %v", string(protocol.EncodeJSON(block.BlockHeader))))
 }
