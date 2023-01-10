@@ -21,6 +21,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/algorand/go-algorand/deepmind"
 	"os"
 	"path/filepath"
 	"strings"
@@ -1038,6 +1039,9 @@ func (node *AlgorandFullNode) OnNewBlock(block bookkeeping.Block, delta ledgerco
 	node.lastRoundTimestamp = time.Now()
 	node.hasSyncedSinceStartup = true
 	node.syncStatusMu.Unlock()
+	if ctx := deepmind.MaybeSyncContext(node.config); ctx != nil {
+		ctx.LogBlock(&block)
+	}
 
 	// Wake up oldKeyDeletionThread(), non-blocking.
 	select {

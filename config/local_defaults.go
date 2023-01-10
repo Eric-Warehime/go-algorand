@@ -48,6 +48,7 @@ var defaultLocal = Local{
 	DNSSecurityFlags:                           1,
 	DeadlockDetection:                          0,
 	DeadlockDetectionThreshold:                 30,
+	DeepMindEnabled:                            false,
 	DisableLocalhostConnectionRateLimit:        true,
 	DisableNetworking:                          false,
 	DisableOutgoingConnectionThrottling:        false,
