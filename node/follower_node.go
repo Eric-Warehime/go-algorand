@@ -27,6 +27,7 @@ import (
 	"github.com/algorand/go-algorand/agreement"
 	"github.com/algorand/go-algorand/catchup"
 	"github.com/algorand/go-algorand/config"
+	"github.com/algorand/go-algorand/crypto"
 	"github.com/algorand/go-algorand/data"
 	"github.com/algorand/go-algorand/data/account"
 	"github.com/algorand/go-algorand/data/basics"
@@ -39,11 +40,41 @@ import (
 	"github.com/algorand/go-algorand/protocol"
 	"github.com/algorand/go-algorand/rpcs"
 	"github.com/algorand/go-algorand/util/execpool"
+	"github.com/algorand/go-deadlock"
 )
 
 // AlgorandFollowerNode implements follower mode/ledger delta APIs and disables participation-related methods
 type AlgorandFollowerNode struct {
-	AlgorandFullNode
+	mu        deadlock.Mutex
+	ctx       context.Context
+	cancelCtx context.CancelFunc
+	config    config.Local
+
+	ledger *data.Ledger
+	net    network.GossipNode
+
+	catchupService           *catchup.Service
+	catchpointCatchupService *catchup.CatchpointCatchupService
+	blockService             *rpcs.BlockService
+	ledgerService            *rpcs.LedgerService
+
+	rootDir     string
+	genesisID   string
+	genesisHash crypto.Digest
+	devMode     bool // is this node operates in a developer mode ? ( benign agreement, broadcasting transaction generates a new block )
+
+	log logging.Logger
+
+	// syncStatusMu used for locking lastRoundTimestamp and hasSyncedSinceStartup
+	// syncStatusMu added so OnNewBlock wouldn't be blocked by oldKeyDeletionThread during catchup
+	syncStatusMu          deadlock.Mutex
+	lastRoundTimestamp    time.Time
+	hasSyncedSinceStartup bool
+
+	cryptoPool                         execpool.ExecutionPool
+	lowPriorityCryptoVerificationPool  execpool.BacklogPool
+	highPriorityCryptoVerificationPool execpool.BacklogPool
+	catchupBlockAuth                   blockAuthenticatorImpl
 }
 
 // MakeFollower sets up an Algorand data node
@@ -157,24 +188,8 @@ func (node *AlgorandFollowerNode) Start() {
 		node.catchupService.Start()
 		node.blockService.Start()
 		startNetwork()
-
-		node.startMonitoringRoutines()
 	}
 
-}
-
-// startMonitoringRoutines starts the internal monitoring routines used by the node.
-func (node *AlgorandFollowerNode) startMonitoringRoutines() {
-	if node.config.EnableUsageLog {
-		node.monitoringRoutinesWaitGroup.Add(1)
-		go logging.UsageLogThread(node.ctx, node.log, 100*time.Millisecond, nil)
-	}
-}
-
-// waitMonitoringRoutines waits for all the monitoring routines to exit. Note that
-// the node.mu must not be taken, and that the node's context should have been canceled.
-func (node *AlgorandFollowerNode) waitMonitoringRoutines() {
-	node.monitoringRoutinesWaitGroup.Wait()
 }
 
 // Stop stops running the node. Once a node is closed, it can never start again.
@@ -182,7 +197,6 @@ func (node *AlgorandFollowerNode) Stop() {
 	node.mu.Lock()
 	defer func() {
 		node.mu.Unlock()
-		node.waitMonitoringRoutines()
 	}()
 
 	node.net.ClearHandlers()
@@ -201,6 +215,22 @@ func (node *AlgorandFollowerNode) Stop() {
 	node.cryptoPool.Shutdown()
 	node.cancelCtx()
 }
+
+// Ledger exposes the node's ledger handle to the algod API code
+func (node *AlgorandFollowerNode) Ledger() *data.Ledger { return node.ledger }
+
+// Config returns a copy of the node's Local configuration
+func (node *AlgorandFollowerNode) Config() config.Local { return node.config }
+
+// GenesisID returns the ID of the genesis node.
+func (node *AlgorandFollowerNode) GenesisID() string { return node.genesisID }
+
+// GenesisHash returns the hash of the genesis configuration.
+func (node *AlgorandFollowerNode) GenesisHash() crypto.Digest { return node.genesisHash }
+
+// ListeningAddress retrieves the node's current listening address, if any.
+// Returns true if currently listening, false otherwise.
+func (node *AlgorandFollowerNode) ListeningAddress() (string, bool) { return "", false }
 
 // BroadcastSignedTxGroup errors in follower mode
 func (node *AlgorandFollowerNode) BroadcastSignedTxGroup(_ []transactions.SignedTxn) (err error) {
@@ -270,6 +300,21 @@ func (node *AlgorandFollowerNode) OnNewBlock(block bookkeeping.Block, delta ledg
 	node.syncStatusMu.Unlock()
 }
 
+// Status returns a StatusReport structure reporting our status as Active and with our ledger's LastRound
+func (node *AlgorandFollowerNode) Status() (s StatusReport, err error) {
+	node.syncStatusMu.Lock()
+	s.LastRoundTimestamp = node.lastRoundTimestamp
+	s.HasSyncedSinceStartup = node.hasSyncedSinceStartup
+	node.syncStatusMu.Unlock()
+
+	node.mu.Lock()
+	defer node.mu.Unlock()
+	if node.catchpointCatchupService != nil {
+		return catchpointCatchupStatus(node.catchpointCatchupService.GetLatestBlockHeader(), node.catchpointCatchupService.GetStatistics()), nil
+	}
+	return latestBlockStatus(node.ledger, node.catchupService)
+}
+
 // StartCatchup starts the catchpoint mode and attempt to get to the provided catchpoint
 // this function is intended to be called externally via the REST api interface.
 func (node *AlgorandFollowerNode) StartCatchup(catchpoint string) error {
@@ -292,6 +337,22 @@ func (node *AlgorandFollowerNode) StartCatchup(catchpoint string) error {
 	}
 	node.catchpointCatchupService.Start(node.ctx)
 	node.log.Infof("starting catching up toward catchpoint %s", catchpoint)
+	return nil
+}
+
+// AbortCatchup aborts the given catchpoint
+// this function is intended to be called externally via the REST api interface.
+func (node *AlgorandFollowerNode) AbortCatchup(catchpoint string) error {
+	node.mu.Lock()
+	defer node.mu.Unlock()
+	if node.catchpointCatchupService == nil {
+		return nil
+	}
+	stats := node.catchpointCatchupService.GetStatistics()
+	if stats.CatchpointLabel != catchpoint {
+		return fmt.Errorf("unable to abort catchpoint catchup for '%s' - already catching up '%s'", catchpoint, stats.CatchpointLabel)
+	}
+	node.catchpointCatchupService.Abort()
 	return nil
 }
 
@@ -318,7 +379,6 @@ func (node *AlgorandFollowerNode) SetCatchpointCatchupMode(catchpointCatchupMode
 			// stop..
 			defer func() {
 				node.mu.Unlock()
-				node.waitMonitoringRoutines()
 			}()
 			node.net.ClearHandlers()
 			node.catchupService.Stop()
@@ -340,8 +400,6 @@ func (node *AlgorandFollowerNode) SetCatchpointCatchupMode(catchpointCatchupMode
 
 		// Set up a context we can use to cancel goroutines on Stop()
 		node.ctx, node.cancelCtx = context.WithCancel(context.Background())
-
-		node.startMonitoringRoutines()
 
 		// at this point, the catchpoint catchup is done ( either successfully or not.. )
 		node.catchpointCatchupService = nil
@@ -375,13 +433,13 @@ func (node *AlgorandFollowerNode) IsParticipating() bool {
 func (node *AlgorandFollowerNode) SetSyncRound(rnd uint64) error {
 	// Calculate the first round for which we want to disable catchup from the network.
 	// This is based on the size of the cache used in the ledger.
-	disableSyncRound := rnd + node.Config().MaxAcctLookback
+	disableSyncRound := rnd + node.config.MaxAcctLookback
 	return node.catchupService.SetDisableSyncRound(disableSyncRound)
 }
 
 // GetSyncRound retrieves the sync round, removes cache offset used during SetSyncRound
 func (node *AlgorandFollowerNode) GetSyncRound() uint64 {
-	return basics.SubSaturate(node.catchupService.GetDisableSyncRound(), node.Config().MaxAcctLookback)
+	return basics.SubSaturate(node.catchupService.GetDisableSyncRound(), node.config.MaxAcctLookback)
 }
 
 // UnsetSyncRound removes the sync round constraint on the catchup service

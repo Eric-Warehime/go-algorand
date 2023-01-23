@@ -136,12 +136,6 @@ type AlgorandFullNode struct {
 
 	log logging.Logger
 
-	// syncStatusMu used for locking lastRoundTimestamp and hasSyncedSinceStartup
-	// syncStatusMu added so OnNewBlock wouldn't be blocked by oldKeyDeletionThread during catchup
-	syncStatusMu          deadlock.Mutex
-	lastRoundTimestamp    time.Time
-	hasSyncedSinceStartup bool
-
 	cryptoPool                         execpool.ExecutionPool
 	lowPriorityCryptoVerificationPool  execpool.BacklogPool
 	highPriorityCryptoVerificationPool execpool.BacklogPool
@@ -680,60 +674,60 @@ func (node *AlgorandFullNode) GetPendingTransaction(txID transactions.Txid) (res
 
 // Status returns a StatusReport structure reporting our status as Active and with our ledger's LastRound
 func (node *AlgorandFullNode) Status() (s StatusReport, err error) {
-	node.syncStatusMu.Lock()
-	s.LastRoundTimestamp = node.lastRoundTimestamp
-	s.HasSyncedSinceStartup = node.hasSyncedSinceStartup
-	node.syncStatusMu.Unlock()
-
 	node.mu.Lock()
 	defer node.mu.Unlock()
 	if node.catchpointCatchupService != nil {
-		// we're in catchpoint catchup mode.
-		lastBlockHeader := node.catchpointCatchupService.GetLatestBlockHeader()
-		s.LastRound = lastBlockHeader.Round
-		s.LastVersion = lastBlockHeader.CurrentProtocol
-		s.NextVersion, s.NextVersionRound, s.NextVersionSupported = lastBlockHeader.NextVersionInfo()
-		s.StoppedAtUnsupportedRound = s.LastRound+1 == s.NextVersionRound && !s.NextVersionSupported
-
-		// for now, I'm leaving this commented out. Once we refactor some of the ledger locking mechanisms, we
-		// should be able to make this call work.
-		//s.LastCatchpoint = node.ledger.GetLastCatchpointLabel()
-
-		// report back the catchpoint catchup progress statistics
-		stats := node.catchpointCatchupService.GetStatistics()
-		s.Catchpoint = stats.CatchpointLabel
-		s.CatchpointCatchupTotalAccounts = stats.TotalAccounts
-		s.CatchpointCatchupProcessedAccounts = stats.ProcessedAccounts
-		s.CatchpointCatchupVerifiedAccounts = stats.VerifiedAccounts
-		s.CatchpointCatchupTotalKVs = stats.TotalKVs
-		s.CatchpointCatchupProcessedKVs = stats.ProcessedKVs
-		s.CatchpointCatchupVerifiedKVs = stats.VerifiedKVs
-		s.CatchpointCatchupTotalBlocks = stats.TotalBlocks
-		s.CatchpointCatchupAcquiredBlocks = stats.AcquiredBlocks
-		s.CatchupTime = time.Now().Sub(stats.StartTime)
-	} else {
-		// we're not in catchpoint catchup mode
-		var b bookkeeping.BlockHeader
-		s.LastRound = node.ledger.Latest()
-		b, err = node.ledger.BlockHdr(s.LastRound)
-		if err != nil {
-			return
-		}
-		s.LastVersion = b.CurrentProtocol
-		s.NextVersion, s.NextVersionRound, s.NextVersionSupported = b.NextVersionInfo()
-
-		s.StoppedAtUnsupportedRound = s.LastRound+1 == s.NextVersionRound && !s.NextVersionSupported
-		s.LastCatchpoint = node.ledger.GetLastCatchpointLabel()
-		s.SynchronizingTime = node.catchupService.SynchronizingTime()
-		s.CatchupTime = node.catchupService.SynchronizingTime()
-
-		s.UpgradePropose = b.UpgradeVote.UpgradePropose
-		s.UpgradeApprove = b.UpgradeApprove
-		s.UpgradeDelay = uint64(b.UpgradeVote.UpgradeDelay)
-		s.NextProtocolVoteBefore = b.NextProtocolVoteBefore
-		s.NextProtocolApprovals = b.UpgradeState.NextProtocolApprovals
-
+		return catchpointCatchupStatus(node.catchpointCatchupService.GetLatestBlockHeader(), node.catchpointCatchupService.GetStatistics()), nil
 	}
+	return latestBlockStatus(node.ledger, node.catchupService)
+}
+
+func catchpointCatchupStatus(lastBlockHeader bookkeeping.BlockHeader, stats catchup.CatchpointCatchupStats) (s StatusReport) {
+	// we're in catchpoint catchup mode.
+	s.LastRound = lastBlockHeader.Round
+	s.LastVersion = lastBlockHeader.CurrentProtocol
+	s.NextVersion, s.NextVersionRound, s.NextVersionSupported = lastBlockHeader.NextVersionInfo()
+	s.StoppedAtUnsupportedRound = s.LastRound+1 == s.NextVersionRound && !s.NextVersionSupported
+
+	// for now, I'm leaving this commented out. Once we refactor some of the ledger locking mechanisms, we
+	// should be able to make this call work.
+	//s.LastCatchpoint = node.ledger.GetLastCatchpointLabel()
+
+	// report back the catchpoint catchup progress statistics
+	s.Catchpoint = stats.CatchpointLabel
+	s.CatchpointCatchupTotalAccounts = stats.TotalAccounts
+	s.CatchpointCatchupProcessedAccounts = stats.ProcessedAccounts
+	s.CatchpointCatchupVerifiedAccounts = stats.VerifiedAccounts
+	s.CatchpointCatchupTotalKVs = stats.TotalKVs
+	s.CatchpointCatchupProcessedKVs = stats.ProcessedKVs
+	s.CatchpointCatchupVerifiedKVs = stats.VerifiedKVs
+	s.CatchpointCatchupTotalBlocks = stats.TotalBlocks
+	s.CatchpointCatchupAcquiredBlocks = stats.AcquiredBlocks
+	s.CatchupTime = time.Since(stats.StartTime)
+	return
+}
+
+func latestBlockStatus(ledger *data.Ledger, catchupService *catchup.Service) (s StatusReport, err error) {
+	// we're not in catchpoint catchup mode
+	var b bookkeeping.BlockHeader
+	s.LastRound = ledger.Latest()
+	b, err = ledger.BlockHdr(s.LastRound)
+	if err != nil {
+		return
+	}
+	s.LastVersion = b.CurrentProtocol
+	s.NextVersion, s.NextVersionRound, s.NextVersionSupported = b.NextVersionInfo()
+
+	s.StoppedAtUnsupportedRound = s.LastRound+1 == s.NextVersionRound && !s.NextVersionSupported
+	s.LastCatchpoint = ledger.GetLastCatchpointLabel()
+	s.SynchronizingTime = catchupService.SynchronizingTime()
+	s.CatchupTime = catchupService.SynchronizingTime()
+
+	s.UpgradePropose = b.UpgradeVote.UpgradePropose
+	s.UpgradeApprove = b.UpgradeApprove
+	s.UpgradeDelay = uint64(b.UpgradeVote.UpgradeDelay)
+	s.NextProtocolVoteBefore = b.NextProtocolVoteBefore
+	s.NextProtocolApprovals = b.UpgradeState.NextProtocolApprovals
 
 	return
 }
@@ -1035,10 +1029,6 @@ func (node *AlgorandFullNode) OnNewBlock(block bookkeeping.Block, delta ledgerco
 	if node.ledger.Latest() > block.Round() {
 		return
 	}
-	node.syncStatusMu.Lock()
-	node.lastRoundTimestamp = time.Now()
-	node.hasSyncedSinceStartup = true
-	node.syncStatusMu.Unlock()
 
 	// Wake up oldKeyDeletionThread(), non-blocking.
 	select {
